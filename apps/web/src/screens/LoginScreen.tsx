@@ -9,21 +9,7 @@ import {
   KeyboardAvoidingView,
   Platform,
 } from 'react-native';
-
-// ══════════════════════════════════════════════════════════
-// 🔐 完全自托管 OTP 登录流程
-//
-// 不再依赖 Supabase Auth 的 signInWithOtp / verifyOtp
-// 改用自己后端服务器管理的 OTP 系统
-//
-// 流程：
-//   1. 前端 → POST /api/auth/send-otp → 后端生成并保存 OTP
-//   2. 开发者从 http://localhost:3001/admin 查看 OTP
-//   3. 前端 → POST /api/auth/verify-otp → 后端验证 OTP
-//   4. 验证成功后，可选：同步用户到 Supabase Auth（如果需要）
-// ══════════════════════════════════════════════════════════
-
-const SERVER_URL = 'http://localhost:3001'; // 后端服务器地址
+import { supabase } from '../services/supabase';
 
 export default function LoginScreen({ navigation }: any) {
   const [phone, setPhone] = useState('');
@@ -32,10 +18,7 @@ export default function LoginScreen({ navigation }: any) {
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
 
-  /**
-   * 第一步：请求后端发送 OTP 验证码
-   * 调用自己的 API，不使用 Supabase Auth 的 OTP 功能
-   */
+  /** 第一步：通过 Supabase Auth 发送 OTP 验证码 */
   const handleSendCode = async () => {
     const cleanPhone = phone.trim();
     setErrorMsg('');
@@ -45,38 +28,35 @@ export default function LoginScreen({ navigation }: any) {
       return;
     }
 
-    console.log('[Login] 请求发送验证码到:', cleanPhone);
+    console.log('[Login] 通过 Supabase Auth 发送验证码到:', cleanPhone);
     setLoading(true);
 
     try {
-      const response = await fetch(`${SERVER_URL}/api/auth/send-otp`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ phone: cleanPhone }),
+      const { error, data } = await supabase.auth.signInWithOtp({
+        phone: cleanPhone,
       });
 
-      const result = await response.json();
-      console.log('[Login] send-otp response:', result);
+      console.log('[Login] signInWithOtp response:', { error, data });
 
-      if (!response.ok || !result.success) {
-        setErrorMsg(`发送失败: ${result.error || '未知错误'}`);
+      if (error) {
+        const errMsg = error.message || JSON.stringify(error) || '未知错误';
+        console.error('[Login] Supabase signInWithOtp 错误:', error);
+        setErrorMsg(`发送失败: ${errMsg}`);
         return;
       }
 
-      console.log('[Login] ✅ 验证码已发送！请在后台查看。');
+      console.log('[Login] 验证码发送成功（由 Supabase Auth 生成）');
       setStep('otp');
       setOtp('');
     } catch (err: any) {
       console.error('[Login] 发送异常:', err);
-      setErrorMsg(`网络错误: 无法连接到服务器 (${SERVER_URL})`);
+      setErrorMsg(`网络错误: ${err.message}`);
     } finally {
       setLoading(false);
     }
   };
 
-  /**
-   * 第二步：请求后端验证 OTP
-   */
+  /** 第二步：通过 Supabase Auth 验证 OTP */
   const handleVerifyOtp = async () => {
     const code = otp.trim();
     setErrorMsg('');
@@ -86,32 +66,23 @@ export default function LoginScreen({ navigation }: any) {
       return;
     }
 
-    console.log('[Login] 验证 OTP:', code);
+    console.log('[Login] 通过 Supabase Auth 验证 OTP:', code);
     setLoading(true);
 
     try {
-      const response = await fetch(`${SERVER_URL}/api/auth/verify-otp`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          phone: phone.trim(), 
-          otp: code 
-        }),
+      const { data, error } = await supabase.auth.verifyOtp({
+        phone: phone.trim(),
+        token: code,
+        type: 'sms',
       });
 
-      const result = await response.json();
-      console.log('[Login] verify-otp response:', result);
-
-      if (!response.ok || !result.success) {
-        setErrorMsg(`验证失败: ${result.error || '验证码错误或已过期'}`);
+      if (error) {
+        console.error('[Login] Supabase verifyOtp 错误:', error.message);
+        setErrorMsg(`验证失败: ${error.message}`);
         return;
       }
 
-      console.log('[Login] ✅ 验证成功！用户信息:', result.user);
-      
-      // TODO: 可选 - 将登录状态保存到本地存储或全局状态管理
-      // 例如：AsyncStorage.setItem('user', JSON.stringify(result.user))
-      
+      console.log('[Login] 验证成功，用户:', data.user?.id);
       navigation.replace('Home');
     } catch (err: any) {
       console.error('[Login] 验证异常:', err);
@@ -212,10 +183,10 @@ export default function LoginScreen({ navigation }: any) {
 
             <View style={styles.devBanner}>
               <Text style={styles.devBannerText}>
-                🛠️ 开发模式验证码
+                🔐 Supabase Auth 验证码
               </Text>
               <Text style={styles.devBannerSub}>
-                请访问 http://localhost:3001/admin 查看验证码
+                验证码已由 Supabase 发送到您的手机
               </Text>
             </View>
 
