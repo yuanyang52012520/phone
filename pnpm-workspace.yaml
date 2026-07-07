@@ -1,0 +1,7 @@
+packages:
+  - 'apps/*'
+  - 'packages/*'
+
+allowBuilds:
+  '@alicloud/openapi-core': true
+  esbuild: true

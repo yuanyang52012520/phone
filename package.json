@@ -1,0 +1,14 @@
+{
+  "name": "eater-system",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev:server": "pnpm --filter @eater/server dev",
+    "dev:web": "pnpm --filter @eater/web start",
+    "dev:web:web": "pnpm --filter @eater/web start:web",
+    "dev": "pnpm run --parallel dev:server dev:web"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

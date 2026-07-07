@@ -1,0 +1,13 @@
+{
+  "expo": {
+    "name": "食客系统",
+    "slug": "eater-system",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "scheme": "eater-system",
+    "platforms": ["ios", "android", "web"],
+    "web": {
+      "bundler": "metro"
+    }
+  }
+}
