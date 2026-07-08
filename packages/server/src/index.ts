@@ -3,6 +3,8 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import path from 'path';
 import crypto from 'crypto';
+import jwt from 'jsonwebtoken';
+import bcrypt from 'bcryptjs';
 import { createClient } from '@supabase/supabase-js';
 
 // 加载 .env 文件（从项目根目录）
@@ -31,9 +33,810 @@ if (!supabaseAdmin) {
 const app = express();
 const PORT = process.env.SERVER_PORT || 3001;
 
+// ============================================================
+// JWT 配置
+// ============================================================
+const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
+
 // 中间件
 app.use(cors());
 app.use(express.json());
+
+// ============================================================
+// JWT 认证中间件
+// ============================================================
+interface JwtPayload {
+  userId: string;
+  phone: string;
+}
+
+function authMiddleware(req: any, res: any, next: any) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: '未提供认证令牌' });
+  }
+
+  const token = authHeader.replace('Bearer ', '');
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET) as JwtPayload;
+    req.user = decoded;
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: '令牌无效或已过期' });
+  }
+}
+
+// ============================================================
+// 【新增】检查手机号是否已注册
+// 用于判断用户是新注册还是老用户登录
+// ============================================================
+app.get('/api/auth/check-phone/:phone', async (req, res) => {
+  try {
+    const { phone } = req.params;
+    const normalizedPhone = normalizePhone(phone);
+
+    if (!supabaseAdmin) {
+      return res.status(500).json({ error: '数据库未连接' });
+    }
+
+    // 查询 profiles 表
+    const { data, error } = await supabaseAdmin
+      .from('profiles')
+      .select('id, is_profile_completed, nickname')
+      .eq('phone', normalizedPhone)
+      .single();
+
+    if (error && error.code !== 'PGRST116') {
+      console.error('[Check Phone] 查询错误:', error);
+      return res.status(500).json({ error: '查询失败', detail: error.message });
+    }
+
+    if (!data) {
+      return res.json({ registered: false });
+    }
+
+    return res.json({
+      registered: true,
+      profileCompleted: data.is_profile_completed,
+      nickname: data.nickname
+    });
+  } catch (err: any) {
+    console.error('[Check Phone] 异常:', err);
+    res.status(500).json({ error: '服务器错误' });
+  }
+});
+
+// ============================================================
+// 【核心】发送短信验证码（通过 Supabase Auth）
+//
+// 前端调用此接口 → 后端通过 Supabase Admin API 触发 SMS OTP
+// 验证码由 Supabase 生成并发送到用户手机
+// ============================================================
+app.post('/api/auth/send-sms', async (req, res) => {
+  try {
+    const { phone } = req.body;
+
+    if (!phone || typeof phone !== 'string') {
+      return res.status(400).json({ error: '手机号不能为空' });
+    }
+
+    const normalizedPhone = normalizePhone(phone);
+
+    console.log('════════════════════════════════════════════════');
+    console.log('   📨 [Send SMS] 发送验证码请求');
+    console.log(`   📞 手机号:   ${normalizedPhone}`);
+    console.log('════════════════════════════════════════════════');
+
+    // 通过 Supabase Admin API 发送 OTP（触发 SMS）
+    // 使用 GoTrue 的 /otp endpoint 或 signInWithOtp 的底层实现
+    const response = await fetch(`${SUPABASE_URL}/auth/v1/otp`, {
+      method: 'POST',
+      headers: {
+        'apikey': SUPABASE_SERVICE_KEY,
+        'Authorization': `Bearer ${SUPABASE_SERVICE_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        phone: normalizedPhone,
+        create_user: true, // 自动创建用户（如果不存在）
+        channel: 'sms',     // 短信通道
+      }),
+    });
+
+    if (!response.ok) {
+      const errData = await response.json().catch(() => ({}));
+      console.error(`   ❌ 发送失败: ${response.status}`, errData);
+      
+      // 如果是速率限制错误，返回友好提示
+      if (response.status === 429) {
+        return res.status(429).json({ 
+          error: '发送过于频繁，请稍后再试', 
+          code: 'RATE_LIMITED' 
+        });
+      }
+      
+      return res.status(response.status).json({ 
+        error: errData?.message || `发送失败 (${response.status})`,
+        detail: errData,
+      });
+    }
+
+    const result = await response.json().catch(() => ({}));
+
+    console.log('');
+    console.log('   ✅ 验证码已发送！');
+    console.log(`   💡 提示：请查看手机或访问 Supabase Auth Logs 获取开发测试用的验证码`);
+    console.log('');
+
+    res.json({
+      success: true,
+      message: '验证码已发送',
+      data: {
+        phone: normalizedPhone,
+        hint: '请查看手机接收的验证码',
+        dev_hint: process.env.NODE_ENV === 'development'
+          ? '开发模式：可从 Supabase Dashboard → Auth Logs 获取验证码'
+          : undefined,
+      },
+    });
+
+  } catch (err: any) {
+    console.error('[Send SMS] 异常:', err.message);
+    res.status(500).json({ error: '服务器内部错误', detail: err.message });
+  }
+});
+
+// ============================================================
+// 【核心】验证短信验证码（通过 Supabase Auth）
+//
+// 前端提交 OTP → 后端向 Supabase Auth 验证
+// 验证成功后返回用户信息和 JWT Token
+// ============================================================
+app.post('/api/auth/verify-sms', async (req, res) => {
+  try {
+    const { phone, otp } = req.body;
+
+    if (!phone || !otp) {
+      return res.status(400).json({ error: '手机号和验证码不能为空' });
+    }
+
+    const cleanedOtp = String(otp).replace(/[^0-9]/g, '');
+    const normalizedPhone = normalizePhone(phone);
+
+    if (cleanedOtp.length < 4 || cleanedOtp.length > 8) {
+      return res.status(400).json({ error: '验证码格式不正确' });
+    }
+
+    console.log('════════════════════════════════════════════════');
+    console.log('   🔑 [Verify SMS] 验证码验证请求');
+    console.log(`   📞 手机号:   ${normalizedPhone}`);
+    console.log(`   🔑 验证码:   ${'*'.repeat(cleanedOtp.length)} (${cleanedOtp.length}位)`);
+    console.log('════════════════════════════════════════════════');
+
+    // 方案1：使用 Supabase GoTrue API 验证 OTP
+    let authUser: any = null;
+    
+    try {
+      const verifyResponse = await fetch(`${SUPABASE_URL}/auth/v1/verify`, {
+        method: 'POST',
+        headers: {
+          'apikey': SUPABASE_SERVICE_KEY,
+          'Authorization': `Bearer ${SUPABASE_SERVICE_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          type: 'sms',
+          phone: normalizedPhone,
+          token: cleanedOtp,
+          create_user: true,
+        }),
+      });
+
+      if (!verifyResponse.ok) {
+        const verifyErr = await verifyResponse.json().catch(() => ({}));
+        
+        // 验证码错误或过期
+        if (verifyResponse.status === 401 || verifyResponse.status === 400 || verifyResponse.status === 422) {
+          console.error(`   ❌ 验证失败:`, verifyErr?.error_description || verifyErr?.msg || JSON.stringify(verifyErr));
+          return res.status(401).json({ 
+            error: verifyErr?.error_description || verifyErr?.msg || '验证码错误或已过期',
+            code: 'OTP_INVALID',
+          });
+        }
+        
+        throw new Error(verifyErr?.message || `验证请求失败 (${verifyResponse.status})`);
+      }
+
+      const verifyResult = await verifyResponse.json();
+      authUser = verifyResult.user;
+      
+      if (!authUser) {
+        throw new Error('未获取到用户信息');
+      }
+
+      console.log(`   ✅ Supabase Auth 验证成功！用户ID: ${authUser.id}`);
+
+    } catch (verifyErr: any) {
+      // 如果 GoTrue verify 接口不可用，尝试备用方案：直接查询 profiles 表
+      console.log(`   ⚠️  Supabase Auth 验证异常: ${verifyErr.message}`);
+      console.log(`   💡 尝试备用验证方式...`);
+
+      // 备用方案：检查缓存中的 OTP（用于开发调试）
+      const cachedOtp = otpStore.get(normalizedPhone);
+      
+      if (!cachedOtp || Date.now() > cachedOtp.expiresAt) {
+        return res.status(401).json({ 
+          error: '验证码无效或已过期', 
+          code: 'OTP_EXPIRED',
+          hint: '请重新发送验证码',
+        });
+      }
+      
+      if (cachedOtp.otp !== cleanedOtp) {
+        return res.status(401).json({ error: '验证码错误', code: 'OTP_WRONG' });
+      }
+      
+      // 验证成功，清除缓存
+      otpStore.delete(normalizedPhone);
+      console.log('   ✅ 缓存验证码验证成功（开发模式）');
+    }
+
+    // 检查是否已有 profile 记录
+    let profileData: any = null;
+    let isNewUser = false;
+
+    try {
+      const { data: profile } = await supabaseAdmin!
+        .from('profiles')
+        .select('*')
+        .eq('phone', normalizedPhone)
+        .single();
+
+      profileData = profile;
+    } catch {
+      isNewUser = true;
+    }
+
+    if (!profileData) {
+      isNewUser = true;
+    }
+
+    console.log('');
+    console.log(`   👤 用户状态: ${isNewUser ? '新用户' : '老用户'}`);
+    console.log('════════════════════════════════════════════════');
+    console.log('');
+
+    res.json({
+      success: true,
+      verified: true,
+      isNewUser,
+      user: {
+        supabase_id: authUser?.id || null,
+        phone: normalizedPhone,
+        email: authUser?.email || null,
+        ...(profileData ? {
+          id: profileData.id,
+          nickname: profileData.nickname,
+          avatar_url: profileData.avatar_url,
+          is_profile_completed: profileData.is_profile_completed,
+        } : {}),
+      },
+    });
+
+  } catch (err: any) {
+    console.error('[Verify SMS] 异常:', err.message);
+    res.status(500).json({ error: '服务器内部错误', detail: err.message });
+  }
+});
+
+// ============================================================
+// 【新增】验证码登录（OTP 验证后获取 JWT Token）
+//
+// 用于老用户通过验证码登录时，获取或创建 JWT Token
+// 如果用户已有 profile → 直接返回 JWT
+// 如果用户没有 profile → 创建基础 profile 并返回 JWT
+// ============================================================
+app.post('/api/auth/otp-login', async (req, res) => {
+  try {
+    const { phone, auth_user_id } = req.body;
+
+    if (!phone) {
+      return res.status(400).json({ error: '手机号不能为空' });
+    }
+
+    if (!supabaseAdmin) {
+      return res.status(500).json({ error: '数据库未连接' });
+    }
+
+    const normalizedPhone = normalizePhone(phone);
+
+    // 查询是否已有 profile
+    let { data: profile, error } = await supabaseAdmin
+      .from('profiles')
+      .select('*')
+      .eq('phone', normalizedPhone)
+      .single();
+
+    if (error && error.code !== 'PGRST116') {
+      console.error('[OTP Login] 查询错误:', error);
+    }
+
+    // 如果已有 profile，直接返回 JWT
+    if (profile) {
+      // 检查账号状态
+      if (!profile.is_active) {
+        return res.status(403).json({ error: '账号已被禁用' });
+      }
+
+      // 更新最后登录时间
+      await supabaseAdmin
+        .from('profiles')
+        .update({ updated_at: new Date().toISOString() })
+        .eq('id', profile.id);
+
+      // 生成 JWT
+      const token = jwt.sign(
+        { userId: profile.id, phone: normalizedPhone },
+        JWT_SECRET,
+        { expiresIn: JWT_EXPIRES_IN }
+      );
+
+      console.log(`════════════════════════════════════════════════`);
+      console.log(`   ✅ 验证码登录成功（老用户）`);
+      console.log(`   📞 手机号:   ${normalizedPhone}`);
+      console.log(`   🔑 用户ID:   ${profile.id}`);
+      console.log(`════════════════════════════════════════════════`);
+
+      return res.json({
+        success: true,
+        token,
+        user: {
+          id: profile.id,
+          phone: profile.phone,
+          nickname: profile.nickname,
+          avatar_url: profile.avatar_url,
+          is_profile_completed: profile.is_profile_completed,
+        }
+      });
+    }
+
+    // 没有 profile，创建一个基础的（用于已通过 Supabase 验证但还没设置密码的老用户）
+    // 这种情况可能发生在：用户之前用其他方式注册了 Supabase 但没填 profiles
+    console.log('[OTP Login] 用户无 profile 记录，创建基础记录');
+
+    const newProfile = {
+      auth_user_id: auth_user_id || null,
+      phone: normalizedPhone,
+      password_hash: '',  // 密码为空，需要用户后续设置
+      nickname: '',
+      display_name: '',   // 同步设置 display_name
+      avatar_url: null,
+      real_name: null,
+      gender: null,
+      birthday: null,
+      is_profile_completed: false,  // 标记资料未完善
+      is_active: true,
+    };
+
+    const { data: createdData, error: createError } = await supabaseAdmin
+      .from('profiles')
+      .insert(newProfile)
+      .select()
+      .single();
+
+    if (createError) {
+      console.error('[OTP Login] 创建 profile 失败:', createError);
+      
+      if (createError.code === '23505') {
+        return res.status(409).json({ error: '该手机号已被注册' });
+      }
+      return res.status(500).json({ error: '创建用户失败', detail: createError.message });
+    }
+
+    // 生成 JWT
+    const token = jwt.sign(
+      { userId: createdData.id, phone: normalizedPhone },
+      JWT_SECRET,
+      { expiresIn: JWT_EXPIRES_IN }
+    );
+
+    console.log(`════════════════════════════════════════════════`);
+    console.log(`   ✅ 验证码登录成功（新创建 profile）`);
+    console.log(`   📞 手机号:   ${normalizedPhone}`);
+    console.log(`   🔑 用户ID:   ${createdData.id}`);
+    console.log('════════════════════════════════════════════════');
+
+    res.json({
+      success: true,
+      token,
+      user: {
+        id: createdData.id,
+        phone: createdData.phone,
+        nickname: createdData.nickname || '',
+        is_profile_completed: false,  // 提示前端需要完善资料
+      },
+      needCompleteProfile: true,  // 告诉前端需要跳转到资料填写页
+    });
+
+  } catch (err: any) {
+    console.error('[OTP Login] 异常:', err.message);
+    res.status(500).json({ error: '服务器错误', detail: err.message });
+  }
+});
+
+// ============================================================
+// 【新增】创建/完善用户资料（含密码）
+// 新用户验证码通过后调用此接口
+// ============================================================
+app.post('/api/auth/profile', async (req, res) => {
+  try {
+    const { 
+      auth_user_id, 
+      phone, 
+      password, 
+      nickname, 
+      avatar_url,
+      real_name,
+      gender,
+      birthday 
+    } = req.body;
+
+    // 参数校验
+    if (!phone || !password) {
+      return res.status(400).json({ error: '手机号和密码不能为空' });
+    }
+
+    if (!supabaseAdmin) {
+      return res.status(500).json({ error: '数据库未连接' });
+    }
+
+    const normalizedPhone = normalizePhone(phone);
+
+    // 密码强度校验（至少6位）
+    if (password.length < 6) {
+      return res.status(400).json({ error: '密码长度至少6位' });
+    }
+
+    // 使用 bcrypt 加密密码
+    const saltRounds = 10;
+    const passwordHash = await bcrypt.hash(password, saltRounds);
+    
+    // 验证 hash 是否生成成功
+    console.log(`[Create Profile] 密码已加密, hash长度=${passwordHash.length}, 前缀=${passwordHash.substring(0, 15)}`);
+
+    // 插入或更新 profiles 表
+    const profileData = {
+      auth_user_id: auth_user_id || null,
+      phone: normalizedPhone,
+      password_hash: passwordHash,
+      nickname: nickname || '',
+      display_name: nickname || '',  // 同步到 display_name 字段
+      avatar_url: avatar_url || null,
+      real_name: real_name || null,
+      gender: gender || null,
+      birthday: birthday || null,
+      is_profile_completed: true,
+      has_set_password: true,
+      updated_at: new Date().toISOString()
+    };
+
+    const { data, error } = await supabaseAdmin
+      .from('profiles')
+      .upsert(profileData)
+      .select();
+
+    if (error) {
+      console.error('[Create Profile] 错误:', error);
+      
+      // 处理唯一约束冲突（手机号已存在）
+      if (error.code === '23505') {
+        return res.status(409).json({ error: '该手机号已被注册' });
+      }
+      return res.status(400).json({ error: '保存失败', detail: error.message });
+    }
+
+    // 生成 JWT Token
+    const token = jwt.sign(
+      { userId: data[0].id, phone: normalizedPhone },
+      JWT_SECRET,
+      { expiresIn: JWT_EXPIRES_IN }
+    );
+
+    console.log('════════════════════════════════════════════════');
+    console.log('   ✅ 用户资料创建成功');
+    console.log(`   📞 手机号:   ${normalizedPhone}`);
+    console.log(`   👤 昵称:     ${nickname || '未设置'}`);
+    console.log(`   🔑 用户ID:   ${data[0].id}`);
+    console.log('════════════════════════════════════════════════');
+
+    res.json({
+      success: true,
+      token,
+      profile: {
+        id: data[0].id,
+        phone: normalizedPhone,
+        nickname: data[0].nickname,
+        is_profile_completed: data[0].is_profile_completed
+      }
+    });
+  } catch (err: any) {
+    console.error('[Create Profile] 异常:', err);
+    res.status(500).json({ error: '服务器错误', detail: err.message });
+  }
+});
+
+// ============================================================
+// 【新增】密码登录接口
+// 老用户使用手机号+密码登录
+// ============================================================
+app.post('/api/auth/login-password', async (req, res) => {
+  try {
+    const { phone, password } = req.body;
+
+    // 参数校验
+    if (!phone || !password) {
+      return res.status(400).json({ error: '手机号和密码不能为空' });
+    }
+
+    if (!supabaseAdmin) {
+      return res.status(500).json({ error: '数据库未连接' });
+    }
+
+    const normalizedPhone = normalizePhone(phone);
+
+    // 查询用户
+    const { data: profile, error } = await supabaseAdmin
+      .from('profiles')
+      .select('*')
+      .eq('phone', normalizedPhone)
+      .single();
+
+    if (error && error.code !== 'PGRST116') {
+      console.error('[Password Login] 查询错误:', error);
+      return res.status(500).json({ error: '查询失败' });
+    }
+
+    if (!profile) {
+      return res.status(401).json({ error: '该手机号未注册' });
+    }
+
+    // 检查是否有密码
+    if (!profile.password_hash) {
+      console.error(`[Password Login] 用户 ${normalizedPhone} 没有设置密码`);
+      return res.status(401).json({ error: '该账号未设置密码，请使用验证码登录后设置密码' });
+    }
+
+    // 验证密码
+    let isValid = false;
+    try {
+      isValid = await bcrypt.compare(password, profile.password_hash);
+      console.log(`[Password Login] 密码验证: phone=${normalizedPhone}, 输入长度=${password.length}, 结果=${isValid}`);
+    } catch (err) {
+      console.error('[Password Login] 密码比对异常:', err);
+      return res.status(500).json({ error: '密码验证失败' });
+    }
+
+    if (!isValid) {
+      return res.status(401).json({ error: '密码错误' });
+    }
+
+    if (!isValid) {
+      return res.status(401).json({ error: '密码错误' });
+    }
+
+    // 生成 JWT Token
+    const token = jwt.sign(
+      { userId: profile.id, phone: normalizedPhone },
+      JWT_SECRET,
+      { expiresIn: JWT_EXPIRES_IN }
+    );
+
+    // 更新最后登录时间
+    await supabaseAdmin
+      .from('profiles')
+      .update({ updated_at: new Date().toISOString() })
+      .eq('id', profile.id);
+
+    console.log('════════════════════════════════════════════════');
+    console.log('   ✅ 密码登录成功');
+    console.log(`   📞 手机号:   ${normalizedPhone}`);
+    console.log(`   👤 用户ID:   ${profile.id}`);
+    console.log('════════════════════════════════════════════════');
+
+    res.json({
+      success: true,
+      token,
+      user: {
+        id: profile.id,
+        phone: profile.phone,
+        nickname: profile.nickname,
+        avatar_url: profile.avatar_url,
+        is_profile_completed: profile.is_profile_completed
+      }
+    });
+  } catch (err: any) {
+    console.error('[Password Login] 异常:', err);
+    res.status(500).json({ error: '服务器错误', detail: err.message });
+  }
+});
+
+// ============================================================
+// 【新增】获取当前用户信息（基于 JWT）
+// ============================================================
+app.get('/api/auth/me-jwt', authMiddleware, async (req: any, res: any) => {
+  try {
+    const { userId } = req.user;
+
+    if (!supabaseAdmin) {
+      return res.status(500).json({ error: '数据库未连接' });
+    }
+
+    const { data: profile, error } = await supabaseAdmin
+      .from('profiles')
+      .select('*')
+      .eq('id', userId)
+      .single();
+
+    if (error || !profile) {
+      return res.status(404).json({ error: '用户不存在' });
+    }
+
+    res.json({
+      user: {
+        id: profile.id,
+        phone: profile.phone,
+        nickname: profile.nickname,
+        avatar_url: profile.avatar_url,
+        real_name: profile.real_name,
+        gender: profile.gender,
+        birthday: profile.birthday,
+        is_profile_completed: profile.is_profile_completed,
+        created_at: profile.created_at
+      }
+    });
+  } catch (err: any) {
+    console.error('[Get Me] 异常:', err);
+    res.status(500).json({ error: '服务器错误' });
+  }
+});
+
+// ============================================================
+// 【新增】修改密码（需要 JWT 认证）
+// ============================================================
+app.post('/api/auth/change-password', authMiddleware, async (req: any, res: any) => {
+  try {
+    const { userId } = req.user;
+    const { old_password, new_password } = req.body;
+
+    // 参数校验
+    if (!old_password || !new_password) {
+      return res.status(400).json({ error: '旧密码和新密码不能为空' });
+    }
+
+    if (new_password.length < 6) {
+      return res.status(400).json({ error: '新密码长度至少6位' });
+    }
+
+    if (!supabaseAdmin) {
+      return res.status(500).json({ error: '数据库未连接' });
+    }
+
+    // 查询当前用户
+    const { data: profile, error } = await supabaseAdmin
+      .from('profiles')
+      .select('*')
+      .eq('id', userId)
+      .single();
+
+    if (error || !profile) {
+      return res.status(404).json({ error: '用户不存在' });
+    }
+
+    // 验证旧密码
+    const isValid = await bcrypt.compare(old_password, profile.password_hash);
+    if (!isValid) {
+      return res.status(400).json({ error: '旧密码错误' });
+    }
+
+    // 加密新密码
+    const saltRounds = 10;
+    const newPasswordHash = await bcrypt.hash(new_password, saltRounds);
+
+    // 更新密码
+    const { error: updateError } = await supabaseAdmin
+      .from('profiles')
+      .update({ 
+        password_hash: newPasswordHash, 
+        has_set_password: true,
+        updated_at: new Date().toISOString() 
+      })
+      .eq('id', userId);
+
+    if (updateError) {
+      console.error('[Change Password] 错误:', updateError);
+      return res.status(400).json({ error: '更新失败', detail: updateError.message });
+    }
+
+    console.log(`   ✅ 用户 ${userId} 修改密码成功`);
+
+    res.json({
+      success: true,
+      message: '密码修改成功'
+    });
+  } catch (err: any) {
+    console.error('[Change Password] 异常:', err);
+    res.status(500).json({ error: '服务器错误', detail: err.message });
+  }
+});
+
+// ============================================================
+// 【新增】更新个人资料（需要 JWT 认证）
+// 用于编辑昵称、头像、真实姓名、性别、生日等信息
+// 密码请使用 /api/auth/change-password 接口
+// ============================================================
+app.put('/api/auth/profile', authMiddleware, async (req: any, res: any) => {
+  try {
+    const { userId } = req.user;
+    const {
+      nickname,
+      avatar_url,
+      real_name,
+      gender,
+      birthday,
+    } = req.body;
+
+    if (!supabaseAdmin) {
+      return res.status(500).json({ error: '数据库未连接' });
+    }
+
+    // 构建更新数据（只包含提供的字段）
+    const updateData: Record<string, any> = {
+      updated_at: new Date().toISOString(),
+    };
+
+    if (nickname !== undefined) {
+      updateData.nickname = nickname;
+      updateData.display_name = nickname;  // 同步更新 display_name
+    }
+    if (avatar_url !== undefined) updateData.avatar_url = avatar_url || null;
+    if (real_name !== undefined) updateData.real_name = real_name || null;
+    if (gender !== undefined) updateData.gender = Number(gender) || 0;
+    if (birthday !== undefined) updateData.birthday = birthday || null;
+
+    // 执行更新
+    const { data, error } = await supabaseAdmin
+      .from('profiles')
+      .update(updateData)
+      .eq('id', userId)
+      .select()
+      .single();
+
+    if (error) {
+      console.error('[Update Profile] 错误:', error);
+      return res.status(400).json({ error: '更新失败', detail: error.message });
+    }
+
+    console.log(`   ✅ 用户 ${userId} 资料更新成功`);
+
+    res.json({
+      success: true,
+      message: '资料更新成功',
+      profile: {
+        id: data.id,
+        phone: data.phone,
+        nickname: data.nickname,
+        avatar_url: data.avatar_url,
+        real_name: data.real_name,
+        gender: data.gender,
+        birthday: data.birthday,
+      }
+    });
+  } catch (err: any) {
+    console.error('[Update Profile] 异常:', err);
+    res.status(500).json({ error: '服务器错误', detail: err.message });
+  }
+});
 
 // ============================================================
 // 内存缓存（开发/测试环境使用）
