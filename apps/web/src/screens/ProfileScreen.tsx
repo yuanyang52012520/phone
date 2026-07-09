@@ -10,24 +10,19 @@ import {
   Platform,
   ScrollView,
   SafeAreaView,
-  Image,
-  Alert,
 } from 'react-native';
 import { supabase } from '../services/supabase';
 
 // API 基础地址
 const SERVER_URL = 'http://localhost:3001';
 
-type GenderOption = 0 | 1 | 2; // 0: 保密, 1: 男, 2: 女
-
 interface UserProfile {
   id: string;
   phone: string;
-  nickname: string;
-  avatar_url: string | null;
-  real_name: string | null;
-  gender: number;
-  birthday: string | null;
+  username: string;
+  display_name: string | null;
+  bio: string | null;
+  region: string | null;
 }
 
 export default function ProfileScreen({ navigation, route }: any) {
@@ -35,11 +30,10 @@ export default function ProfileScreen({ navigation, route }: any) {
   const initialUserInfo = route?.params?.userInfo;
 
   // 表单状态
-  const [nickname, setNickname] = useState('');
-  const [realName, setRealName] = useState('');
-  const [gender, setGender] = useState<GenderOption>(0);
-  const [birthday, setBirthday] = useState('');
-  const [avatarUrl, setAvatarUrl] = useState('');
+  const [username, setUsername] = useState('');
+  const [displayName, setDisplayName] = useState('');
+  const [bio, setBio] = useState('');
+  const [region, setRegion] = useState('');
   
   // 原始手机号（只读显示）
   const [phone, setPhone] = useState('');
@@ -76,11 +70,10 @@ export default function ProfileScreen({ navigation, route }: any) {
             const data = await response.json();
             const profile: UserProfile = data.user;
             
-            setNickname(profile.nickname || '');
-            setRealName(profile.real_name || '');
-            setGender((profile.gender as GenderOption) || 0);
-            setBirthday(profile.birthday || '');
-            setAvatarUrl(profile.avatar_url || '');
+            setUsername(profile.username || '');
+            setDisplayName(profile.display_name || '');
+            setBio(profile.bio || '');
+            setRegion(profile.region || '');
             setPhone(profile.phone || '');
             return;
           }
@@ -91,9 +84,8 @@ export default function ProfileScreen({ navigation, route }: any) {
 
       // 回退：使用传入的初始信息
       if (initialUserInfo) {
-        setNickname(initialUserInfo.nickname || '');
+        setUsername(initialUserInfo.username || '');
         setPhone(initialUserInfo.phone || '');
-        setAvatarUrl(initialUserInfo.avatar_url || '');
       }
     } catch (err) {
       console.error('[Profile] 加载用户资料失败:', err);
@@ -103,14 +95,11 @@ export default function ProfileScreen({ navigation, route }: any) {
     }
   };
 
-  // 获取存储的 JWT Token
+  // 获取存储的 JWT Token（用于加载资料时）
   const getStoredToken = async (): Promise<string | null> => {
     try {
-      // 可以从 AsyncStorage 或其他地方获取 token
-      // 这里简化处理，实际项目中应从安全存储获取
-      const { data: { user } } = await supabase.auth.getSession();
-      // 如果使用自定义 token 存储，这里需要调整
-      return user ? 'dummy-token' : null; // 占位，需要根据实际存储方式调整
+      const { data: { session } } = await supabase.auth.getSession();
+      return session?.access_token || null;
     } catch {
       return null;
     }
@@ -123,45 +112,35 @@ export default function ProfileScreen({ navigation, route }: any) {
     setErrorMsg('');
     setSuccessMsg('');
 
-    // 昵称校验
-    if (nickname.trim().length > 20) {
-      setErrorMsg('昵称不能超过20个字符');
-      return;
-    }
-
-    // 生日格式校验（如果填写了）
-    if (birthday && !/^\d{4}-\d{2}-\d{2}$/.test(birthday)) {
-      setErrorMsg('生日格式应为 YYYY-MM-DD');
+    // 用户名校验
+    if (username.trim().length > 20) {
+      setErrorMsg('用户名不能超过20个字符');
       return;
     }
 
     setSaving(true);
 
     try {
-      const token = await getStoredToken();
+      // 获取 Supabase session 作为认证凭证
+      const { data: { session } } = await supabase.auth.getSession();
       
-      if (!token) {
-        // 如果没有 token，尝试用 session
-        const { data: { session } } = await supabase.auth.getSession();
-        if (!session?.access_token) {
-          setErrorMsg('未登录，无法保存资料');
-          setSaving(false);
-          return;
-        }
+      if (!session?.access_token) {
+        setErrorMsg('未登录，无法保存资料');
+        setSaving(false);
+        return;
       }
 
       const response = await fetch(`${SERVER_URL}/api/auth/profile`, {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`,
+          'Authorization': `Bearer ${session.access_token}`,
         },
         body: JSON.stringify({
-          nickname: nickname.trim() || undefined,
-          avatar_url: avatarUrl.trim() || undefined,
-          real_name: realName.trim() || undefined,
-          gender: gender !== 0 ? gender : undefined,
-          birthday: birthday.trim() || undefined,
+          username: username.trim() || undefined,
+          display_name: displayName.trim() || undefined,
+          bio: bio.trim() || null,
+          region: region.trim() || null,
         }),
       });
 
@@ -193,62 +172,20 @@ export default function ProfileScreen({ navigation, route }: any) {
   };
 
   // ============================================================
-  // 选择性别
-  // ============================================================
-  const renderGenderSelector = () => (
-    <View style={styles.genderContainer}>
-      <Text style={styles.label}>性别</Text>
-      <View style={styles.genderOptions}>
-        <TouchableOpacity
-          style={[styles.genderOption, gender === 0 && styles.genderOptionActive]}
-          onPress={() => setGender(0)}
-        >
-          <Text style={[styles.genderText, gender === 0 && styles.genderTextActive]}>
-            保密
-          </Text>
-        </TouchableOpacity>
-        
-        <TouchableOpacity
-          style={[styles.genderOption, gender === 1 && styles.genderOptionActive]}
-          onPress={() => setGender(1)}
-        >
-          <Text style={[styles.genderText, gender === 1 && styles.genderTextActive]}>
-            👨 男
-          </Text>
-        </TouchableOpacity>
-        
-        <TouchableOpacity
-          style={[styles.genderOption, gender === 2 && styles.genderOptionActive]}
-          onPress={() => setGender(2)}
-        >
-          <Text style={[styles.genderText, gender === 2 && styles.genderTextActive]}>
-            👩 女
-          </Text>
-        </TouchableOpacity>
-      </View>
-    </View>
-  );
-
-  // ============================================================
   // 头像区域
   // ============================================================
   const renderAvatarSection = () => (
     <View style={styles.avatarSection}>
-      <TouchableOpacity style={styles.avatarWrapper}>
-        {avatarUrl ? (
-          <Image source={{ uri: avatarUrl }} style={styles.avatar} />
-        ) : (
-          <View style={styles.avatarPlaceholder}>
-            <Text style={styles.avatarEmoji}>
-              {nickname?.charAt(0) || '👤'}
-            </Text>
-          </View>
-        )}
+      <View style={styles.avatarWrapper}>
+        <View style={styles.avatarPlaceholder}>
+          <Text style={styles.avatarEmoji}>
+            {username?.charAt(0) || '👤'}
+          </Text>
+        </View>
         <View style={styles.cameraBadge}>
           <Text style={styles.cameraIcon}>📷</Text>
         </View>
-      </TouchableOpacity>
-      <Text style={styles.avatarHint}>点击更换头像</Text>
+      </View>
     </View>
   );
 
@@ -328,16 +265,16 @@ export default function ProfileScreen({ navigation, route }: any) {
 
             <View style={styles.fieldDivider} />
 
-            {/* 昵称 */}
+            {/* 用户名 */}
             <View style={styles.fieldGroup}>
-              <Text style={styles.label}>昵称</Text>
+              <Text style={styles.label}>用户名</Text>
               <TextInput
                 style={styles.input}
-                placeholder="请输入昵称"
+                placeholder="请输入用户名"
                 placeholderTextColor="#999"
-                value={nickname}
+                value={username}
                 onChangeText={(text) => {
-                  setNickname(text);
+                  setUsername(text);
                   setErrorMsg('');
                 }}
                 maxLength={20}
@@ -346,62 +283,55 @@ export default function ProfileScreen({ navigation, route }: any) {
 
             <View style={styles.fieldDivider} />
 
-            {/* 真实姓名 */}
+            {/* 显示名称 */}
             <View style={styles.fieldGroup}>
-              <Text style={styles.label}>真实姓名</Text>
+              <Text style={styles.label}>显示名称</Text>
               <TextInput
                 style={styles.input}
-                placeholder="请输入真实姓名（可选）"
+                placeholder="请输入显示名称（可选）"
                 placeholderTextColor="#999"
-                value={realName}
+                value={displayName}
                 onChangeText={(text) => {
-                  setRealName(text);
+                  setDisplayName(text);
                   setErrorMsg('');
                 }}
-                maxLength={10}
               />
             </View>
 
             <View style={styles.fieldDivider} />
 
-            {/* 性别选择 */}
-            {renderGenderSelector()}
-
-            <View style={styles.fieldDivider} />
-
-            {/* 生日 */}
+            {/* 个人简介 */}
             <View style={styles.fieldGroup}>
-              <Text style={styles.label}>生日</Text>
+              <Text style={styles.label}>个人简介</Text>
               <TextInput
-                style={styles.input}
-                placeholder="YYYY-MM-DD（可选）"
+                style={[styles.input, styles.textArea]}
+                placeholder="介绍一下自己（可选）"
                 placeholderTextColor="#999"
-                value={birthday}
+                value={bio}
                 onChangeText={(text) => {
-                  setBirthday(text);
+                  setBio(text);
                   setErrorMsg('');
                 }}
-                maxLength={10}
-                keyboardType="numbers-and-punctuation"
+                multiline
+                numberOfLines={3}
+                maxLength={200}
               />
             </View>
 
             <View style={styles.fieldDivider} />
 
-            {/* 头像 URL（高级选项） */}
+            {/* 地区 */}
             <View style={styles.fieldGroup}>
-              <Text style={styles.label}>头像链接（URL）</Text>
+              <Text style={styles.label}>地区</Text>
               <TextInput
                 style={styles.input}
-                placeholder="https://example.com/avatar.jpg"
+                placeholder="所在地区（可选）"
                 placeholderTextColor="#999"
-                value={avatarUrl}
+                value={region}
                 onChangeText={(text) => {
-                  setAvatarUrl(text);
+                  setRegion(text);
                   setErrorMsg('');
                 }}
-                autoCapitalize="none"
-                keyboardType="url"
               />
             </View>
           </View>
@@ -410,9 +340,9 @@ export default function ProfileScreen({ navigation, route }: any) {
           <View style={styles.hintCard}>
             <Text style={styles.hintTitle}>💡 提示</Text>
             <Text style={styles.hintText}>
-              • 昵称将显示在您的个人主页{'\n'}
-              • 生日仅用于个性化推荐，不会公开显示{'\n'}
-              • 头像支持 JPG、PNG 格式图片链接
+              • 用户名将显示在您的个人主页{'\n'}
+              • 显示名称可以是真实姓名或昵称{'\n'}
+              • 个人简介帮助其他用户了解您
             </Text>
           </View>
 
@@ -504,11 +434,6 @@ const styles = StyleSheet.create({
   avatarWrapper: {
     position: 'relative',
   },
-  avatar: {
-    width: 90,
-    height: 90,
-    borderRadius: 45,
-  },
   avatarPlaceholder: {
     width: 90,
     height: 90,
@@ -535,11 +460,6 @@ const styles = StyleSheet.create({
   },
   cameraIcon: {
     fontSize: 14,
-  },
-  avatarHint: {
-    marginTop: 10,
-    fontSize: 12,
-    color: '#999',
   },
 
   formCard: {
@@ -614,6 +534,11 @@ const styles = StyleSheet.create({
     backgroundColor: '#fafafa',
   },
 
+  textArea: {
+    minHeight: 80,
+    textAlignVertical: 'top',
+  },
+
   readOnlyField: {
     backgroundColor: '#f5f5f5',
     borderRadius: 8,
@@ -629,37 +554,6 @@ const styles = StyleSheet.create({
   readOnlyHint: {
     fontSize: 11,
     color: '#bbb',
-  },
-
-  genderContainer: {
-    paddingHorizontal: 16,
-    paddingVertical: 14,
-  },
-  genderOptions: {
-    flexDirection: 'row',
-    gap: 12,
-  },
-  genderOption: {
-    flex: 1,
-    paddingVertical: 10,
-    borderRadius: 8,
-    borderWidth: 1.5,
-    borderColor: '#e8e8e8',
-    alignItems: 'center',
-    backgroundColor: '#fafafa',
-  },
-  genderOptionActive: {
-    borderColor: '#e94560',
-    backgroundColor: '#fff5f7',
-  },
-  genderText: {
-    fontSize: 14,
-    color: '#666',
-    fontWeight: '500',
-  },
-  genderTextActive: {
-    color: '#e94560',
-    fontWeight: '600',
   },
 
   hintCard: {

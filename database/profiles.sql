@@ -2,7 +2,7 @@
 -- 食客系统 - 用户资料表 (profiles)
 -- 用于存储用户个人信息和密码
 -- ============================================================
-
+/*
 CREATE TABLE IF NOT EXISTS profiles (
   -- 主键
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -67,3 +67,4 @@ CREATE POLICY "Users can update own profile"
   ON profiles FOR UPDATE
   USING (auth.uid() = auth_user_id)
   WITH CHECK (auth.uid() = auth_user_id);
+  */

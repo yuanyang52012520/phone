@@ -6,6 +6,7 @@
     "orientation": "portrait",
     "scheme": "eater-system",
     "platforms": ["ios", "android", "web"],
+    "newArchEnabled": true,
     "web": {
       "bundler": "metro"
     }
